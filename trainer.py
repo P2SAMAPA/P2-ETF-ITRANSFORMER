@@ -10,27 +10,15 @@ from itransformer import train_model, predict
 from sklearn.preprocessing import StandardScaler
 
 def create_sequences(df, seq_len):
-    """
-    Create sequences of length seq_len for each variable (ETF and macro).
-    df: DataFrame with shape (T, num_vars)
-    Returns X: (T-seq_len, num_vars, seq_len), y: (T-seq_len, num_vars) (next value for each variable)
-    """
     T, num_vars = df.shape
     X, y = [], []
     for i in range(seq_len, T):
-        X.append(df.iloc[i-seq_len:i].values.T)   # shape (num_vars, seq_len)
-        y.append(df.iloc[i].values)                # next day for each variable
+        X.append(df.iloc[i-seq_len:i].values.T)   # (num_vars, seq_len)
+        y.append(df.iloc[i].values)
     return np.array(X), np.array(y)
 
 def compute_conformal_intervals(predictions, residuals, confidence=0.9):
-    """
-    predictions: array of predicted returns for each ETF
-    residuals: array of residuals (y_true - y_pred) from calibration set
-    Returns lower, upper bounds for each prediction (based on quantile of residual absolute)
-    """
-    # Absolute residuals
     abs_res = np.abs(residuals)
-    # Quantile
     q = np.quantile(abs_res, confidence)
     lower = predictions - q
     upper = predictions + q
@@ -49,49 +37,48 @@ def main():
     for universe_name, tickers in config.UNIVERSES.items():
         print(f"\n=== Universe: {universe_name} (iTransformer) ===")
         combined = data_manager.prepare_combined_data(df, tickers)
+        print(f"  Combined data length: {len(combined)} days")
         if combined.empty or len(combined) < max(config.WINDOWS) + config.SEQ_LEN + 10:
-            print("  Insufficient data")
-            all_results[universe_name] = {"top_etfs": []}
-            continue
+            print("  Insufficient combined data – falling back to returns only")
+            # Fallback: use only ETF returns (no macro)
+            combined = data_manager.prepare_returns_matrix(df, tickers)
+            print(f"  Returns‑only data length: {len(combined)} days")
+            if combined.empty or len(combined) < max(config.WINDOWS) + config.SEQ_LEN + 10:
+                print("  Still insufficient, skipping universe")
+                all_results[universe_name] = {"top_etfs": []}
+                continue
 
         best_per_etf = {}
         window_results = {}
 
         for win in config.WINDOWS:
             if len(combined) < win + config.SEQ_LEN + 10:
-                print(f"  Skipping window {win}d (insufficient data)")
+                print(f"  Skipping window {win}d (need at least {win + config.SEQ_LEN + 10} days, have {len(combined)})")
                 continue
             print(f"  Processing window {win}d...")
-            # Use last `win` days of data
             data_win = combined.iloc[-win:]
-            # Standardise each column (variable)
+            # Standardise
             scaler = StandardScaler()
             data_scaled = pd.DataFrame(scaler.fit_transform(data_win), index=data_win.index, columns=data_win.columns)
             # Create sequences
             X, y = create_sequences(data_scaled, config.SEQ_LEN)
             if len(X) < 20:
+                print(f"    Not enough sequences (need 20, got {len(X)})")
                 continue
-            # Split into train (80%) and calibration (20%) – calibration for conformal prediction
             split = int(0.8 * len(X))
             X_train, X_cal = X[:split], X[split:]
             y_train, y_cal = y[:split], y[split:]
-            # Train model
             num_vars = data_scaled.shape[1]
             model = train_model(X_train, y_train, config.SEQ_LEN, num_vars,
                                 epochs=config.EPOCHS, batch_size=config.BATCH_SIZE,
                                 lr=config.LR, device=device)
-            # Predict on calibration set to compute residuals
             pred_cal = predict(model, X_cal, device)
-            residuals = y_cal - pred_cal   # shape (n_cal, num_vars)
-            # Predict for the most recent day (the last sequence of the training window)
+            residuals = y_cal - pred_cal
             last_seq = data_scaled.iloc[-config.SEQ_LEN:].values.T.reshape(1, num_vars, config.SEQ_LEN)
-            pred_last = predict(model, last_seq, device)[0]   # (num_vars,)
-            # Compute conformal intervals for each variable
+            pred_last = predict(model, last_seq, device)[0]
             lower, upper = compute_conformal_intervals(pred_last, residuals, confidence=config.CONFIDENCE)
-            # Extract only the ETF variables (ignore macro columns)
             etf_cols = [c for c in data_scaled.columns if c not in config.MACRO_COLUMNS]
             etf_indices = [list(data_scaled.columns).index(c) for c in etf_cols]
-            # Score = upper bound (optimistic) – or we could use mean
             scores = {etf_cols[i]: upper[etf_indices[i]] for i in range(len(etf_cols))}
             window_results[win] = scores
             for etf, score in scores.items():
@@ -129,7 +116,7 @@ def main():
 
     import push_results
     push_results.push_daily_result(local_path)
-    print("\n=== iTransformer Engine (with conformal prediction) complete ===")
+    print("\n=== iTransformer Engine complete ===")
 
 if __name__ == "__main__":
     main()
