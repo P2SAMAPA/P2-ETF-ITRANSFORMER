@@ -13,16 +13,23 @@ def load_master_data():
         df.set_index('date', inplace=True)
     return df
 
-def prepare_combined_data(df, universe_tickers):
-    # ETF log returns
+def prepare_returns_matrix(df, universe_tickers):
     returns = pd.DataFrame(index=df.index)
     for ticker in universe_tickers:
         if ticker in df.columns:
             price = df[ticker]
             if not price.isna().all():
                 returns[ticker] = np.log(price / price.shift(1))
-    # Macro levels (fill forward)
-    macro = df[config.MACRO_COLUMNS].copy() if all(c in df.columns for c in config.MACRO_COLUMNS) else pd.DataFrame()
-    macro = macro.ffill()
+    returns = returns.dropna(how='all')
+    return returns
+
+def prepare_combined_data(df, universe_tickers):
+    # ETF log returns
+    returns = prepare_returns_matrix(df, universe_tickers)
+    if returns.empty:
+        return returns
+    # Macro columns: use only those that exist
+    macro_cols = [c for c in config.MACRO_COLUMNS if c in df.columns]
+    macro = df[macro_cols].ffill() if macro_cols else pd.DataFrame(index=returns.index)
     combined = pd.concat([returns, macro], axis=1).dropna()
     return combined
